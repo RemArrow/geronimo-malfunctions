@@ -219,10 +219,25 @@ Verified in game on the HK416 (also as the Noveske Chainsaw), the M4A1 URGI and 
 - the dud's click and dead trigger;
 - full auto, and the random roll.
 
+## Multiplayer
+
+Everyone needs the plugin. The host fires every round in the game, a client's too: a client's shot
+reaches the host, and the shot cycles the gun there, so **the host rolls and applies every player's
+stoppages**. While a client's gun is stopped, the host blocks it (the gun's replicated
+`bIsFiringBlocked`), so it won't fire; on the client's own machine the plugin gives the dead trigger,
+a click and then nothing, as on a dud. Racking clears it: the charging handle and slide report to the
+host (`HandleBackServer` / `HandleForwardServer`), which clears it and lets the gun fire again.
+
+Verified in a two-player test (two copies of the game on one PC, `Utils\MPDev`, 2026-10-13): a stovepipe
+forced on the client's gun on the host stopped it there, the client's next shot did not fire, the
+client's copy of the gun showed it blocked, its trigger went dead, and a rack cleared it and the next
+shot fired.
+
 ## Known limitations
 
-- Multiplayer is untested. Stoppages are rolled and applied on the machine of the player holding
-  the gun.
+- Multiplayer: on a client's own machine a stoppage shows only as the dead trigger. The bolt held
+  back, the case in the ejection port and the double feed's second round are drawn on the host
+  only (the game doesn't replicate the bolt's lock).
 - Duds can't come up on the first round after a reload; the roll happens when a round is fired.
 
 ## Sources
@@ -247,6 +262,9 @@ Verified in game on the HK416 (also as the Noveske Chainsaw), the M4A1 URGI and 
 
 ## Changes
 
+- **0.6.0:** multiplayer. The host decides every player's stoppages (before, a client's guns never
+  stopped: their shots cycle on the host, where only the host's own gun was looked at), blocks a
+  stopped gun for its player, and the plugin on a client gives the dead trigger.
 - **0.5.0:** the P320 is not drop safe. Like a pre-2017 P320, dropped so the back of the slide hits
   first, it fires its chambered round two times in three.
 

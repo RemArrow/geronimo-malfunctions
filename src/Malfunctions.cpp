@@ -7,8 +7,8 @@
 //
 // Built from the game's own gun mechanics (GunReceiver / GunChamberComponent / Rifle): every shot passes
 // through GunChamberComponent:OnFired, where a malfunction is rolled; racking passes through
-// GunHandleComponent:HandleBackServer / HandleForwardServer, where it is cleared. Only guns held by the
-// local player are affected.
+// GunHandleComponent:HandleBackServer / HandleForwardServer, where it is cleared. Only players' guns are affected,
+// decided on the machine that fires them (the host, in multiplayer).
 #define NOMINMAX
 #include <GML/GML.hpp>
 #include <windows.h>
@@ -19,7 +19,7 @@
 
 using namespace gml;
 
-#define MALFUNCTIONS_VERSION "0.5.0"
+#define MALFUNCTIONS_VERSION "0.6.0"
 GML_PLUGIN("com.remarrow.malfunctions", "Malfunctions", MALFUNCTIONS_VERSION);
 
 struct Vec { double x, y, z; };
@@ -51,6 +51,7 @@ struct Jam {
     bool magOut = false;        // double feed: the magazine has been stripped
     bool clicked = false;       // dud: the hammer has already fallen on it
     bool triggerWasDown = false;
+    bool remote = false;        // held by another player (multiplayer, on the host): see Remote()
     ULONGLONG lastPull = 0;
     float boltLockWas = -1;     // the gun's own BoltLockedProgress, restored on clearing
     Object casing, round;       // the visible spent case / second round
@@ -88,12 +89,27 @@ static bool Supports(Object gun, Kind k) {
     return k == FailureToFeed || ActionOf(gun);
 }
 
-// Held by this machine's player (not an AI, not another player).
-static bool HeldByLocalPlayer(Object gun) {
+// Held by a player (not an AI) whose shots this machine fires. In multiplayer the host fires every round,
+// a client's too (its shot reaches the host as FireRoundServer, and the shot cycles the gun there, through
+// GunChamberComponent:OnFired, which never runs on the client), so the host decides every player's
+// stoppages; a client decides none. Alone, that is your own gun.
+static bool HeldByPlayerHere(Object gun) {
     Params h(gun, "GetHoldingCharacter");
     h.Call();
     Object who = h.Return<GUObject*>();
-    return who && CallBool(who, "IsPlayerControlled") && CallBool(who, "IsLocallyControlled");
+    if (!who || !CallBool(who, "IsPlayerControlled")) return false;
+    return CallBool(gun, "HasAuthority") || CallBool(who, "IsLocallyControlled");
+}
+
+// Held by another player, on the host. Their own machine doesn't get the bolt held back, the case in the port or the
+// round left behind (the game doesn't replicate the bolt's lock, and the rest are this plugin's), but it does get the
+// gun's bIsFiringBlocked: on the host every stoppage of theirs sets it while it lasts, so their gun won't fire, and
+// the plugin on their machine gives a dead trigger (ServerStoppages). Alone, nothing changes.
+static bool Remote(Object gun) {
+    Params h(gun, "GetHoldingCharacter");
+    h.Call();
+    Object who = h.Return<GUObject*>();
+    return who && CallBool(gun, "HasAuthority") && !CallBool(who, "IsLocallyControlled");
 }
 static int Ammo(Object gun) {
     Object well = gun.GetObj("MagWellComponent");
@@ -443,7 +459,7 @@ static void Clear(Object gun, Jam& j, const char* how) {
     DLOG("{}: {} cleared ({})", gun.Name(), KindName(j.kind), how);
     Kind kind = j.kind;
     j.kind = None;  // first, so the unlock below isn't refused as the bolt release on a stoppage
-    if (kind == Dud) gun.SetBool("bIsFiringBlocked", false);
+    if (kind == Dud || j.remote) gun.SetBool("bIsFiringBlocked", false);
     if (kind == FailureToFeed || kind == DoubleFeed) ChamberBlocked(gun, false);
     Remove(j.casing);
     Remove(j.round);
@@ -456,7 +472,7 @@ static void Clear(Object gun, Jam& j, const char* how) {
 // GunChamberComponent:OnFired (pre): a round has just been fired. Rolls what goes wrong with the next.
 static bool OnFired(Object chamber) {
     Object gun = Receiver(chamber);
-    if (!gun || !s_enabled.Value() || !HeldByLocalPlayer(gun)) return false;
+    if (!gun || !s_enabled.Value() || !HeldByPlayerHere(gun)) return false;
     GunState& g = s_guns[gun.ptr];
     bool suppressed = s_suppressors.Value() && Suppressed(gun);
     Factors f = FactorsOf(gun, g, suppressed);  // as the gun was when this round went off
@@ -467,6 +483,7 @@ static bool OnFired(Object chamber) {
     j.armed = None;
     if (k == None || Ammo(gun) <= 0) return false;  // nothing left to feed: nothing to jam
     j.kind = k;
+    j.remote = Remote(gun);
     DLOG("{}: {} - {}, fouling x{:.2f}, suppressor x{:.2f}, grip x{:.2f}", gun.Name(), KindName(k), f.profile->label,
          f.fouling, f.suppressor, f.wrist);
     // On full auto the next shot can come within ~80 ms, so whatever stops it happens right here; the
@@ -547,6 +564,7 @@ static void Watch() {
         case FailureToFeed:
         case Stovepipe:
         case DoubleFeed:
+            if (j.remote) gun.SetBool("bIsFiringBlocked", true);  // what the player's own machine gets of it
             // Something let the bolt go with the handle at rest (not you racking it): it jams again.
             // While the handle is being pulled it is left alone, or a rack could never finish.
             if (!ActionLocked(gun) && !j.handleBack && handle < kAtRest)
@@ -561,6 +579,46 @@ static void Watch() {
         }
         ++it;
     }
+}
+
+// A client in multiplayer: the guns in this player's hands that the host has stopped (bIsFiringBlocked, see
+// Remote()). A trigger pull clicks, then the trigger is dead, as on a dud, until the host clears it (racking).
+static void ServerStoppages() {
+    static std::unordered_map<GUObject*, std::pair<bool, bool>> seen;  // gun -> (trigger was down, clicked)
+    static ULONGLONG next = 0;
+    ULONGLONG now = GetTickCount64();
+    if (now < next) return;
+    next = now + 50;
+    Params gp(Lib("GameplayStatics"), "GetPlayerPawn");
+    gp.SetObj("WorldContextObject", Object(API->WorldContext())).Set("PlayerIndex", (int32_t)0).Call();
+    Object pawn = gp.Return<GUObject*>();
+    if (!pawn || CallBool(pawn, "HasAuthority") || !API->FindFunction(pawn.Struct(), "GetVRComponents")) { seen.clear(); return; }
+    Params vr(pawn, "GetVRComponents");
+    vr.Call();
+    std::unordered_map<GUObject*, std::pair<bool, bool>> held;
+    for (const char* hand : {"LeftController", "RightController"}) {
+        Object ctrl = *(GUObject**)vr.Ptr(hand);
+        if (!ctrl) continue;
+        Params gg(ctrl, "GetGrippedObjects");
+        gg.Call();
+        auto* arr = (GML_TArray*)gg.Ptr("GrippedObjectsArray");
+        for (int i = 0; arr && i < arr->Num; i++) {
+            Object gun(((GUObject**)arr->Data)[i]);
+            if (!gun || !gun.IsA("GunReceiver") || !gun.GetBool("bIsFiringBlocked")) continue;
+            auto it = seen.find(gun.ptr);
+            if (it == seen.end()) DLOG("{}: stopped by the host - the trigger is dead until it is racked", gun.Name());
+            auto st = it != seen.end() ? it->second : std::pair{false, false};
+            bool down = gun.Get<float>("CurrentTrigger") > 0.6f;
+            if (down && !st.first) {
+                PlayAt(gun, st.second ? "DeadTriggerPulled" : "ShotsEmpty");
+                DLOG("{}: stopped by the host - {}", gun.Name(), st.second ? "dead trigger" : "click");
+                st.second = true;
+            }
+            st.first = down;
+            held[gun.ptr] = st;
+        }
+    }
+    seen.swap(held);  // a gun the host has cleared (or that was put down) starts over
 }
 
 // ------------------------------------------------------------------ the P320 is not drop safe
@@ -769,6 +827,7 @@ GML_AWAKE() {
         for (auto& [g, j] : s_jams) jammed |= j.kind != None;
         if (jammed || now - last >= 100) { last = now; Watch(); }
         WatchDroppedP320s();
+        if (s_enabled.Value()) ServerStoppages();
     });
     Message("Malfunctions {} - real-world rates x{}: {}, duds 1 in {:.0f} rounds", MALFUNCTIONS_VERSION, s_multiplier.Value(),
             s_perGun.Value() ? "each gun stops as often as the real one" : "every gun stops as often as an M4A1 (1 in 3600 rounds)",
